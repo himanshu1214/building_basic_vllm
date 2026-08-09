@@ -8,6 +8,16 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+class Sequence:
+    def __init__(self, id: str, prompt: str, response: str | None, timestamp: float):
+        self.id = id
+        self.output = []
+        self.prompt = prompt
+        self.response = response
+        self.timestamp = timestamp
+        self.isFinished = False
+
+
 class LLMEngine:
     """
     This class is actually responsible for interfacing with the model and generating responses
@@ -197,13 +207,3 @@ class WorkloadManager:
             sequence = self.request_map[sequence_id]
             return sequence.isFinished
         return False
-
-
-class Sequence:
-    def __init__(self, id: str, prompt: str, response: str | None, timestamp: float):
-        self.id = id
-        self.output = []
-        self.prompt = prompt
-        self.response = response
-        self.timestamp = timestamp
-        self.isFinished = False
