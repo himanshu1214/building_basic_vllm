@@ -42,9 +42,10 @@ class LLMEngine:
         while not self._isbatch_finished(request_ids):
             sequences = self.workload_manager.generate_batched_request()
             response = self.model_executor.execute_batch(sequences)
-            responses.append(response[0]['generated_response'])
-        for res in response:
-            self.workload_manager.update_sequence_output(res, )
+        
+        for res in response[1]: # 1st index is 'completed'
+            self.workload_manager.remove_active_sequence(res['prompt_id'])
+            self.workload_manager.update_sequence_output(res['prompt_id'], res['generated_response'], isFinished=True)
 
         ### 
         
@@ -52,7 +53,7 @@ class LLMEngine:
         for request_id in request_ids:
             generated_text = self.workload_manager.get_generated_text(request_id).output[0]
             generated_texts.append(generated_text)
-            self.workload_manager.remove_request(request_id)
+            self.workload_manager.remove_active_sequence(request_id)
         return generated_texts
 
 
@@ -83,7 +84,7 @@ class ModelWorker:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, self.tokenizer = ModelManager.load_model(model_name)
     @staticmethod
-    def run(model_name, task_queue, result_queue):
+    def run(model_name, task_queue: Queue, result_queue: Queue):
         worker = ModelWorker(model_name)
         # put the request into the task queue
         while True:
@@ -124,7 +125,7 @@ class WorkloadManager:
         self.incoming_requests = Queue()
 
 
-    def add_request_to_queue(self, prompt):
+    def add_request_to_queue(self, prompt: str) -> str:
         # Add the request to the queue
         request_id = str(uuid.uuid4())
         sequence = Sequence(request_id, prompt, None, None)
@@ -132,7 +133,7 @@ class WorkloadManager:
         self.request_map[request_id] = sequence
         return request_id
 
-    def get_generated_text(self, request_id):
+    def get_generated_text(self, request_id: str) -> Sequence:
         return self.request_map[request_id]
     
     def generate_batched_request(self) -> List[Sequence]:
@@ -142,7 +143,7 @@ class WorkloadManager:
 
         return self.active_requests
 
-    def update_sequence_output(self, sequence_id, token, isFinished)-> Sequence | None:
+    def update_sequence_output(self, sequence_id: str, token: str, isFinished: bool) -> Sequence | None:
         """
         Get the sequence to update with the generated token and mark it as finished as appropriate
         """
@@ -155,7 +156,16 @@ class WorkloadManager:
             return sequence
         return None
 
-    def is_sequence_finished(self, sequence_id):
+    def remove_active_sequence(self, sequence_id: str) -> None:
+        """
+        This method is responsible for removing the sequence based on the request_id/seq_id from  
+        """
+        if sequence_id in self.request_map:
+            sequence = self.request_map[sequence_id]
+            if sequence in self.active_requests:
+                self.active_requests.remove(sequence)
+
+    def is_sequence_finished(self, sequence_id: str) -> bool:
         """
         Check if the sequence is finished based on the 
         """
@@ -165,7 +175,7 @@ class WorkloadManager:
         return False
 
 class Sequence:
-    def __init__(self, id, prompt, response, timestamp):
+    def __init__(self, id: str, prompt: str, response: str | None, timestamp: float):
         self.id = id
         self.output = []
         self.prompt = prompt
