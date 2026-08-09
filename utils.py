@@ -1,6 +1,8 @@
-import torch
 import gc
 import time
+
+import torch
+
 
 def clean_gpu(model):
     if model:
