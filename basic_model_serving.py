@@ -2,7 +2,7 @@ import collections
 import multiprocessing as mp
 import uuid
 from queue import Queue
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -16,6 +16,7 @@ class Sequence:
         self.response = response
         self.timestamp = timestamp
         self.isFinished = False
+        self.token_count = 0
 
 
 class LLMEngine:
@@ -39,8 +40,7 @@ class LLMEngine:
                 return False
         return True
 
-    def generate(self, prompts):
-        responses = []
+    def generate(self, prompts: List[str]) -> List:
         request_ids = []
         for prompt in prompts:
             prompt_id = self.workload_manager.add_request_to_queue(prompt)
@@ -49,14 +49,14 @@ class LLMEngine:
         # Keep generating responses for the sequences untill all the current prompts are responded
         # We are keeping track of the sequences using workload manager
         while not self._isbatch_finished(request_ids):
-            sequences = self.workload_manager.generate_batched_request()
+            sequences: List[Sequence] = self.workload_manager.generate_batched_request()
             response = self.model_executor.execute_batch(sequences)
 
-        for res in response[1]:  # 1st index is 'completed'
-            self.workload_manager.remove_active_sequence(res["prompt_id"])
-            self.wMorkload_manager.update_sequence_output(
-                res["prompt_id"], res["generated_response"], isFinished=True
-            )
+            for res in response[1]:  # 1st index is 'completed'
+                self.workload_manager.remove_active_sequence(res["prompt_id"])
+                self.workload_manager.update_sequence_output(
+                    res["prompt_id"], res["generated_response"], isFinished=True
+                )
 
         ###
 
@@ -94,8 +94,8 @@ class ModelExecutor:
 
         self.worker_process.start()
 
-    def execute_batch(self, prompt):
-        self.task_queue.put((prompt, False))
+    def execute_batch(self, prompts: List[Sequence]) -> tuple[str, Dict[str, str]]:
+        self.task_queue.put((prompts, False))
         results = self.result_queue.get()
         return results
 
@@ -108,26 +108,50 @@ class ModelWorker:
     def __init__(self, model_name):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model, self.tokenizer = ModelManager.load_model(model_name)
+        self.model.to(self.device)
+        self.max_tokens = 20
 
     @staticmethod
     def run(model_name, task_queue: Queue, result_queue: Queue):
         worker = ModelWorker(model_name)
         # put the request into the task queue
         while True:
-            request = task_queue.get()
-            result_queue.put(("completed", worker.generate(request)))
+            sequences, invalid_seq = task_queue.get()  # Tuple[List[Sequence], bool]
+            if invalid_seq:
+                break
+            result_queue.put(("completed", worker.generate(sequences)))
 
-    def generate(self, prompt) -> Dict[str, str]:
+    def generate(self, prompts: List[Sequence]) -> Dict[str, str]:
         """ "
         Initialize the model to generate the response and
         the generated is decoded back to the text format using tokenizer
         """
-        outputs = self.model.generate()
-        generated_text = self.tokenizer.decode(outputs[0])
-        return {
-            "prompt_id": prompt.id,
-            "generated_response": generated_text,
-        }
+        prompt_txt = [p.prompt for p in prompts]
+        request_ids = [p.id for p in prompts]
+
+        inputs = self.tokenizer(
+            prompt_txt, return_tensors="pt", padding=True, truncation=True
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs.input_ids,
+                max_new_tokens=self.max_tokens,
+                attention_mask=inputs.attention_mask,
+                do_sample=True,
+                top_k=50,
+                top_p=0.95,
+                pad_token_id=self.tokenizer.eos_token_id,
+            )
+
+        generated_text = self.tokenizer.batch_decode(outputs)
+        return [
+            {
+                "prompt_id": request_id,
+                "generated_response": generated_text,
+            }
+            for request_id, generated_text in zip(request_ids, generated_text)
+        ]
 
 
 class ModelManager:
