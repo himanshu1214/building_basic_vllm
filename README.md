@@ -8,6 +8,6 @@ use `uvicorn main:app --reload` to start the service at `127.0.0.1:8000`
 curl -X POST http://127.0.0.1:8000/generate \
   -H "Content-Type: application/json" \
   -d '{
-        "prompts": "Explain KV cache"
+        "prompts": ["Explain KV cache"]
       }'
 ```

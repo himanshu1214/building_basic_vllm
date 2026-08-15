@@ -6,7 +6,17 @@ from typing import Dict, List, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from queue import Empty
+import logging
+import sys
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
 class Sequence:
     def __init__(self, id: str, prompt: str, response: str | None, timestamp: float):
@@ -28,6 +38,7 @@ class LLMEngine:
         self.workload_manager = WorkloadManager()
         self.model_executor = ModelExecutor()
         self.max_tokens = 20
+        self.model_executor.setup_workers("facebook/opt-125m")
 
     def _isbatch_finished(self, request_ids):
         """
@@ -85,6 +96,8 @@ class ModelExecutor:
     def __init__(self):
         self.task_queue = mp.Queue()
         self.result_queue = mp.Queue()
+        self.worker_process = None
+        logger.debug("ModelExecutor initialized with queues")
 
     def setup_workers(self, model_name):
         self.worker_process = mp.Process(
@@ -93,12 +106,36 @@ class ModelExecutor:
         )
 
         self.worker_process.start()
+        print(
+        "Worker PID:",
+        self.worker_process.pid,
+        "alive:",
+        self.worker_process.is_alive(),
+        flush=True,
+        )
 
     def execute_batch(self, prompts: List[Sequence]) -> tuple[str, Dict[str, str]]:
+        print(
+            "Before queue put:",
+            "alive =", self.worker_process.is_alive(),
+            "exitcode =", self.worker_process.exitcode,
+            flush=True,
+        )
         self.task_queue.put((prompts, False))
-        results = self.result_queue.get()
-        return results
-
+        try:
+            results = self.result_queue.get(timeout=120)
+            return results
+        except Empty:
+            print(
+                "After timeout:",
+                "alive =", self.worker_process.is_alive(),
+                "exitcode =", self.worker_process.exitcode,
+                flush=True,
+            )
+            raise RuntimeError(
+            "Model worker did not return a result. "
+            "Check whether the worker process crashed."
+            )
 
 class ModelWorker:
     """
@@ -106,20 +143,38 @@ class ModelWorker:
     """
 
     def __init__(self, model_name):
+        print("Starting ModelWorker...", flush=True)
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print("Device:", self.device, flush=True)
+
+        print("Loading model...", flush=True)
         self.model, self.tokenizer = ModelManager.load_model(model_name)
+
+        print("Moving model to GPU...", flush=True)
         self.model.to(self.device)
+        self.model.eval()
+
+        print("Model ready", flush=True)
         self.max_tokens = 20
 
     @staticmethod
     def run(model_name, task_queue: Queue, result_queue: Queue):
-        worker = ModelWorker(model_name)
+        
+        
         # put the request into the task queue
-        while True:
-            sequences, invalid_seq = task_queue.get()  # Tuple[List[Sequence], bool]
-            if invalid_seq:
-                break
-            result_queue.put(("completed", worker.generate(sequences)))
+        try:
+            print("Worker process starting...", flush=True)
+            worker = ModelWorker(model_name)
+            print(f"Worker started on: {worker.device}", flush=True)
+            while True:
+                sequences, invalid_seq = task_queue.get()  # Tuple[List[Sequence], bool]
+                if invalid_seq:
+                    break
+                result_queue.put(("completed", worker.generate(sequences)))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result_queue.put(("error", repr(e)))
 
     def generate(self, prompts: List[Sequence]) -> Dict[str, str]:
         """ "
