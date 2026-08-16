@@ -1,13 +1,14 @@
-from fastapi import FastAPI, Depends
+import asyncio
+import atexit
+import multiprocessing
+
+from fastapi import Depends, FastAPI
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from vllm import SamplingParams
 
 from basic_model_serving import LLMEngine
-from fastapi.responses import StreamingResponse
 from model_loading import create_llm
-from vllm import SamplingParams
-import multiprocessing
-import atexit
-import asyncio
 
 # Create FastAPI app
 app = FastAPI()
@@ -54,7 +55,7 @@ class BasicBatchGenerateResponse(BaseModel):
 
 
 class StreamGenerateRequest(BaseModel):
-    prompt: list[str]
+    prompt: str
 
 
 @app.post("/basic_generate", response_model=BasicBatchGenerateResponse)
@@ -85,7 +86,7 @@ async def stream_generator(
     """
     This endpoint receives list of prompts and generates the streamed response"""
 
-    async def event_generator(self):
+    async def event_generator():
         loop = asyncio.get_event_loop()
         async for token in llm.event_generator(loop, request.prompt):
             yield token

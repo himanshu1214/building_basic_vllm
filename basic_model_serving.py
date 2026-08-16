@@ -1,16 +1,16 @@
+import asyncio
 import collections
+import json
+import logging
 import multiprocessing as mp
+import sys
+import threading
 import uuid
-from queue import Queue
-from typing import Dict, List, Tuple
+from queue import Empty, Queue
+from typing import Any, Dict, List, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from queue import Empty
-import logging
-import sys
-import asyncio
-import json
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -24,18 +24,14 @@ logger.addHandler(handler)
 class Sequence:
     def __init__(
         self,
-        loop,
-        client_stream,
         id: str,
         prompt: str,
-        response: str | None,
-        timestamp: float,
+        loop=None,
+        client_stream=None,
     ):
         self.id = id
         self.output = []
         self.prompt = prompt
-        self.response = response
-        self.timestamp = timestamp
         self.isFinished = False
         self.token_count = 0
         self.loop = loop
@@ -52,6 +48,8 @@ class LLMEngine:
         self.model_executor = ModelExecutor()
         self.max_tokens = 20
         self.model_executor.setup_workers("facebook/opt-125m")
+        self.thread = threading.Thread(target=self.request_processing_loop, daemon=True)
+        self.thread.start()
 
     def _isbatch_finished(self, request_ids):
         """
@@ -102,38 +100,44 @@ class LLMEngine:
 
     def request_processing_loop(self):
         while True:
-            active_sequences = self.workload_manager.generate_batched_request(
-                is_streaming=True
-            )
-            prompts = [
-                {"prompt": seq.prompt, "req_id": seq.id} for seq in active_sequences
-            ]
+            try:
+                active_sequences = self.workload_manager.generate_batched_request(
+                    is_streaming=True
+                )
+                prompts = [
+                    {"prompt": seq.prompt, "request_id": seq.id}
+                    for seq in active_sequences
+                ]
 
-            tokens_result = self.model_executor.execute_forward_batch(prompts)
+                tokens_result = self.model_executor.execute_forward_batch(prompts)
 
-            for result in tokens_result:
-                seq = self.workload_manager.get_sequence(result["request_id"])
-                if seq.isFinished or seq.token_count > self.max_tokens:
-                    asyncio.run_coroutine_threadsafe(
-                        seq.client_stream.put(None), seq.loop
-                    )
-                    seq.finished = True
-                    self.workload_manager.remove_finished_sequence(result["request_id"])
-                else:
-                    asyncio.run_coroutine_threadsafe(
-                        seq.client_stream.put(
-                            json.dumps(
-                                {
-                                    "token": result["token"],
-                                    "sequence_id": result["request_id"],
-                                }
-                            )
-                        ),
-                        seq.loop,
-                    )
-                    self.workload_manager.update_sequence_output(
-                        result["request_id"], result["token"]
-                    )
+                for result in tokens_result:
+                    seq = self.workload_manager.get_sequence(result["request_id"])
+                    if result["is_finished"] or seq.token_count > self.max_tokens:
+                        asyncio.run_coroutine_threadsafe(
+                            seq.client_stream.put(None), seq.loop
+                        )
+                        seq.isFinished = True
+                        self.workload_manager.remove_finished_sequence(
+                            result["request_id"]
+                        )
+                    else:
+                        asyncio.run_coroutine_threadsafe(
+                            seq.client_stream.put(
+                                json.dumps(
+                                    {
+                                        "token": result["token"],
+                                        "sequence_id": result["request_id"],
+                                    }
+                                )
+                            ),
+                            seq.loop,
+                        )
+                        self.workload_manager.update_sequence_output(
+                            result["request_id"], result["token"], result["is_finished"]
+                        )
+            except Exception as e:
+                print(f"Error found while processing request loop with : {e}")
 
     async def event_generator(self, loop: asyncio.AbstractEventLoop, prompt: str):
 
@@ -262,12 +266,16 @@ class ModelWorker:
             worker = ModelWorker(model_name)
             print(f"Worker started on: {worker.device}", flush=True)
             while True:
-                sequences, is_streaming = task_queue.get()  # Tuple[List[Sequence], bool]
+                sequences, is_streaming = (
+                    task_queue.get()
+                )  # Tuple[List[Sequence], bool]
                 if not sequences:
                     logger.debug("No sequences found")
                     break
                 if is_streaming:
-                    result_queue.put(('stream'), worker.generate_forward_batch(sequences))
+                    result_queue.put(
+                        ("stream", worker.generate_forward_batch(sequences))
+                    )
                 else:
                     result_queue.put(("completed", worker.generate(sequences)))
 
@@ -311,7 +319,7 @@ class ModelWorker:
 
     def generate_forward_batch(self, prompts: List[Dict[str, Any]]):
         """
-        Use this method on streaming prompt sequences 
+        Use this method on streaming prompt sequences
         """
         logger.debug("Begin generating stream token")
         # add optional pad token
@@ -320,11 +328,11 @@ class ModelWorker:
 
         # tokenize
         encoded_prompts = self.tokenizer(
-            [p['prompt'] for p in prompts], 
-            return_tensors="pt", 
+            [p["prompt"] for p in prompts],
+            return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=512
+            max_length=512,
         ).to(self.device)
 
         logger.debug("Added the prompt sequences list as encoded prompts")
@@ -333,28 +341,31 @@ class ModelWorker:
             model_response = self.model(
                 input_ids=encoded_prompts.input_ids,
                 attention_mask=encoded_prompts.attention_mask,
-                use_cache=False
+                use_cache=False,
             )
 
             next_token_logit = model_response.logits[:, -1, :]
             next_token = torch.multinomial(
-                torch.softmax(
-                    next_token_logit / 0.7, dim=-1
-                ), 
-                num_samples=1
+                torch.softmax(next_token_logit / 0.7, dim=-1), num_samples=1
             ).squeeze(-1)
 
             results = []
             for i, prompt_data in enumerate(prompts):
-                token = self.tokenizer.decode(next_token[i].unsqueeze(0), skip_special_token=True)
-                logger.debug(f"Generate token for the given prompt '{prompt_data['prompt']}': '{token}' ")
-                results.append({
-                    'request_id': prompt_data['request_id'],
-                    'token': token,
-                    'is_finished': token == self.tokenizer.eos_token
-
-                })
+                token = self.tokenizer.decode(
+                    next_token[i].unsqueeze(0), skip_special_tokens=True
+                )
+                logger.debug(
+                    f"Generate token for the given prompt '{prompt_data['prompt']}': '{token}' "
+                )
+                results.append(
+                    {
+                        "request_id": prompt_data["request_id"],
+                        "token": token,
+                        "is_finished": token == self.tokenizer.eos_token,
+                    }
+                )
             return results
+
 
 class ModelManager:
     """
@@ -403,15 +414,20 @@ class WorkloadManager:
         """
         request_id = str(uuid.uuid4())
         sequence = Sequence(request_id, prompt, client_stream, loop)
-        self.incoming_streaming_requests.put(sequence)  # Add Sequence into the request Queue
+        self.incoming_streaming_requests.put(
+            sequence
+        )  # Add Sequence into the request Queue
         self.seq_map[request_id] = sequence  # Tracking the prompt here
         return request_id
 
-    def generate_batched_request(self, is_streaming: bool) -> List[Sequence]:
+    def generate_batched_request(self, is_streaming: bool = False) -> List[Sequence]:
         if is_streaming:
-            while self.active_streaming_sequence < self.batch_size and not self.incoming_streaming_requests.empty():
+            while (
+                len(self.active_streaming_sequence) < self.batch_size
+                and not self.incoming_streaming_requests.empty()
+            ):
                 sequence = self.incoming_streaming_requests.get()
-                self.active_streaming_sequence(sequence)
+                self.active_streaming_sequence.append(sequence)
             return self.active_streaming_sequence
         else:
             while (
@@ -448,7 +464,6 @@ class WorkloadManager:
                 self.active_requests.remove(sequence)
             if sequence in self.active_streaming_sequence:
                 self.active_streaming_sequence.remove(sequence)
-
 
     def is_sequence_finished(self, sequence_id: str) -> bool:
         """
