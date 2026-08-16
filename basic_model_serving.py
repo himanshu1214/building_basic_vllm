@@ -140,6 +140,11 @@ class LLMEngine:
                 print(f"Error found while processing request loop with : {e}")
 
     async def event_generator(self, loop: asyncio.AbstractEventLoop, prompt: str):
+        """
+        This method is called inside the endpoint
+        This method uses the eventLoop and adds into workLoadManager request
+        The queue is returned with a data
+        """
 
         asyncio.set_event_loop(loop)
         queue = asyncio.Queue()  # client loop
@@ -188,6 +193,9 @@ class ModelExecutor:
         )
 
     def execute_batch(self, prompts: List[Sequence]) -> tuple[str, Dict[str, str]]:
+        """
+        Method to send the prompts into worker request Queue and load
+        """
         print(
             "Before queue put:",
             "alive =",
@@ -215,6 +223,8 @@ class ModelExecutor:
             )
 
     def execute_forward_batch(self, prompts):
+        """
+        This is similar to batch method"""
 
         if not prompts:
             logger.debug("No prompts received")
@@ -413,7 +423,9 @@ class WorkloadManager:
         Add the prompt sequence into  the request queue and to the sequence map for tracking
         """
         request_id = str(uuid.uuid4())
-        sequence = Sequence(request_id, prompt, client_stream, loop)
+        sequence = Sequence(
+            id=request_id, prompt=prompt, loop=loop, client_stream=client_stream
+        )
         self.incoming_streaming_requests.put(
             sequence
         )  # Add Sequence into the request Queue
@@ -421,6 +433,9 @@ class WorkloadManager:
         return request_id
 
     def generate_batched_request(self, is_streaming: bool = False) -> List[Sequence]:
+        """
+        This is used to batch the coming the incoming requests into active_requests list
+        """
         if is_streaming:
             while (
                 len(self.active_streaming_sequence) < self.batch_size
