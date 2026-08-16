@@ -218,6 +218,8 @@ class ModelExecutor:
             return []
 
         logger.debug(f"Adding streaming batch prompts into task queue: {prompts}")
+
+        # send the batch with streaming flag
         self.task_queue.put((prompts, True))
 
         logger.debug(f"Awaiting results back from result queue")
@@ -260,10 +262,15 @@ class ModelWorker:
             worker = ModelWorker(model_name)
             print(f"Worker started on: {worker.device}", flush=True)
             while True:
-                sequences, invalid_seq = task_queue.get()  # Tuple[List[Sequence], bool]
-                if invalid_seq:
+                sequences, is_streaming = task_queue.get()  # Tuple[List[Sequence], bool]
+                if not sequences:
+                    logger.debug("No sequences found")
                     break
-                result_queue.put(("completed", worker.generate(sequences)))
+                if is_streaming:
+                    result_queue.put(('stream'), worker.generate_forward_batch(sequences))
+                else:
+                    result_queue.put(("completed", worker.generate(sequences)))
+
         except Exception as e:
             import traceback
 
@@ -302,6 +309,52 @@ class ModelWorker:
             for request_id, generated_text in zip(request_ids, generated_text)
         ]
 
+    def generate_forward_batch(self, prompts: List[Dict[str, Any]]):
+        """
+        Use this method on streaming prompt sequences 
+        """
+        logger.debug("Begin generating stream token")
+        # add optional pad token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # tokenize
+        encoded_prompts = self.tokenizer(
+            [p['prompt'] for p in prompts], 
+            return_tensors="pt", 
+            padding=True,
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+
+        logger.debug("Added the prompt sequences list as encoded prompts")
+
+        with torch.no_grad():
+            model_response = self.model(
+                input_ids=encoded_prompts.input_ids,
+                attention_mask=encoded_prompts.attention_mask,
+                use_cache=False
+            )
+
+            next_token_logit = model_response.logits[:, -1, :]
+            next_token = torch.multinomial(
+                torch.softmax(
+                    next_token_logit / 0.7, dim=-1
+                ), 
+                num_samples=1
+            ).squeeze(-1)
+
+            results = []
+            for i, prompt_data in enumerate(prompts):
+                token = self.tokenizer.decode(next_token[i].unsqueeze(0), skip_special_token=True)
+                logger.debug(f"Generate token for the given prompt '{prompt_data['prompt']}': '{token}' ")
+                results.append({
+                    'request_id': prompt_data['request_id'],
+                    'token': token,
+                    'is_finished': token == self.tokenizer.eos_token
+
+                })
+            return results
 
 class ModelManager:
     """
@@ -326,6 +379,7 @@ class WorkloadManager:
         self.request_map = {}
         self.active_requests = []
         self.incoming_requests = Queue()
+        self.incoming_streaming_requests = Queue()
         self.seq_map: Dict[str:Sequence] = {}
         self.active_streaming_sequence: List[Sequence] = []
 
@@ -349,13 +403,16 @@ class WorkloadManager:
         """
         request_id = str(uuid.uuid4())
         sequence = Sequence(request_id, prompt, client_stream, loop)
-        self.incoming_requests.put(sequence)  # Add Sequence into the request Queue
+        self.incoming_streaming_requests.put(sequence)  # Add Sequence into the request Queue
         self.seq_map[request_id] = sequence  # Tracking the prompt here
         return request_id
 
     def generate_batched_request(self, is_streaming: bool) -> List[Sequence]:
         if is_streaming:
-            pass
+            while self.active_streaming_sequence < self.batch_size and not self.incoming_streaming_requests.empty():
+                sequence = self.incoming_streaming_requests.get()
+                self.active_streaming_sequence(sequence)
+            return self.active_streaming_sequence
         else:
             while (
                 len(self.active_requests) < self.batch_size
@@ -389,6 +446,9 @@ class WorkloadManager:
             sequence = self.request_map[sequence_id]
             if sequence in self.active_requests:
                 self.active_requests.remove(sequence)
+            if sequence in self.active_streaming_sequence:
+                self.active_streaming_sequence.remove(sequence)
+
 
     def is_sequence_finished(self, sequence_id: str) -> bool:
         """
