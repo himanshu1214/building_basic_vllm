@@ -9,17 +9,28 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from queue import Empty
 import logging
 import sys
+import asyncio
+import json
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
+
 class Sequence:
-    def __init__(self, id: str, prompt: str, response: str | None, timestamp: float):
+    def __init__(
+        self,
+        loop,
+        client_stream,
+        id: str,
+        prompt: str,
+        response: str | None,
+        timestamp: float,
+    ):
         self.id = id
         self.output = []
         self.prompt = prompt
@@ -27,6 +38,8 @@ class Sequence:
         self.timestamp = timestamp
         self.isFinished = False
         self.token_count = 0
+        self.loop = loop
+        self.client_stream = client_stream
 
 
 class LLMEngine:
@@ -77,7 +90,7 @@ class LLMEngine:
                 request_id
             ).output[0]
             generated_texts.append(generated_text)
-            self.workload_manager.remove_active_sequence(request_id)
+            self.workload_manager.remove_finished_sequence(request_id)
         return generated_texts
 
     def basic_generate_without_batch(self, prompt):
@@ -86,6 +99,62 @@ class LLMEngine:
         return results[1][0][
             "generated_response"
         ]  # 1st index is 'completed' and 0th index is the first sequence
+
+    def request_processing_loop(self):
+        while True:
+            active_sequences = self.workload_manager.generate_batched_request(
+                is_streaming=True
+            )
+            prompts = [
+                {"prompt": seq.prompt, "req_id": seq.id} for seq in active_sequences
+            ]
+
+            tokens_result = self.model_executor.execute_forward_batch(prompts)
+
+            for result in tokens_result:
+                seq = self.workload_manager.get_sequence(result["request_id"])
+                if seq.isFinished or seq.token_count > self.max_tokens:
+                    asyncio.run_coroutine_threadsafe(
+                        seq.client_stream.put(None), seq.loop
+                    )
+                    seq.finished = True
+                    self.workload_manager.remove_finished_sequence(result["request_id"])
+                else:
+                    asyncio.run_coroutine_threadsafe(
+                        seq.client_stream.put(
+                            json.dumps(
+                                {
+                                    "token": result["token"],
+                                    "sequence_id": result["request_id"],
+                                }
+                            )
+                        ),
+                        seq.loop,
+                    )
+                    self.workload_manager.update_sequence_output(
+                        result["request_id"], result["token"]
+                    )
+
+    async def event_generator(self, loop: asyncio.AbstractEventLoop, prompt: str):
+
+        asyncio.set_event_loop(loop)
+        queue = asyncio.Queue()  # client loop
+
+        seq_id = self.workload_manager.add_streaming_request(prompt, queue, loop)
+        print(
+            f"Created queue for sequence {seq_id} in loop {id(loop)} and queue {id(queue._get_loop())}"
+        )  # Debug print
+        try:
+            while True:
+                data = await queue.get()
+                if data is None:
+                    break
+                yield f"data: {data}\n\n\ "
+        except Exception as e:
+            print(f"Error in sequence {seq_id} : {e}")
+        finally:
+            self.workload_manager.remove_finished_sequence(seq_id)
+            print("Removed the sequence from seq_map, stream_map")
 
 
 class ModelExecutor:
@@ -107,18 +176,20 @@ class ModelExecutor:
 
         self.worker_process.start()
         print(
-        "Worker PID:",
-        self.worker_process.pid,
-        "alive:",
-        self.worker_process.is_alive(),
-        flush=True,
+            "Worker PID:",
+            self.worker_process.pid,
+            "alive:",
+            self.worker_process.is_alive(),
+            flush=True,
         )
 
     def execute_batch(self, prompts: List[Sequence]) -> tuple[str, Dict[str, str]]:
         print(
             "Before queue put:",
-            "alive =", self.worker_process.is_alive(),
-            "exitcode =", self.worker_process.exitcode,
+            "alive =",
+            self.worker_process.is_alive(),
+            "exitcode =",
+            self.worker_process.exitcode,
             flush=True,
         )
         self.task_queue.put((prompts, False))
@@ -128,14 +199,37 @@ class ModelExecutor:
         except Empty:
             print(
                 "After timeout:",
-                "alive =", self.worker_process.is_alive(),
-                "exitcode =", self.worker_process.exitcode,
+                "alive =",
+                self.worker_process.is_alive(),
+                "exitcode =",
+                self.worker_process.exitcode,
                 flush=True,
             )
             raise RuntimeError(
-            "Model worker did not return a result. "
-            "Check whether the worker process crashed."
+                "Model worker did not return a result. "
+                "Check whether the worker process crashed."
             )
+
+    def execute_forward_batch(self, prompts):
+
+        if not prompts:
+            logger.debug("No prompts received")
+
+            return []
+
+        logger.debug(f"Adding streaming batch prompts into task queue: {prompts}")
+        self.task_queue.put((prompts, True))
+
+        logger.debug(f"Awaiting results back from result queue")
+        result_type, result = self.result_queue.get()
+
+        logger.debug(f"RESPONSE received : {result}")
+
+        if result_type == "stream":
+            return result
+        else:
+            raise ValueError("Unrecognized result format")
+
 
 class ModelWorker:
     """
@@ -159,8 +253,7 @@ class ModelWorker:
 
     @staticmethod
     def run(model_name, task_queue: Queue, result_queue: Queue):
-        
-        
+
         # put the request into the task queue
         try:
             print("Worker process starting...", flush=True)
@@ -173,6 +266,7 @@ class ModelWorker:
                 result_queue.put(("completed", worker.generate(sequences)))
         except Exception as e:
             import traceback
+
             traceback.print_exc()
             result_queue.put(("error", repr(e)))
 
@@ -232,6 +326,8 @@ class WorkloadManager:
         self.request_map = {}
         self.active_requests = []
         self.incoming_requests = Queue()
+        self.seq_map: Dict[str:Sequence] = {}
+        self.active_streaming_sequence: List[Sequence] = []
 
     def add_request_to_queue(self, prompt: str) -> str:
         # Add the request to the queue
@@ -244,13 +340,29 @@ class WorkloadManager:
     def get_generated_text(self, request_id: str) -> Sequence:
         return self.request_map[request_id]
 
-    def generate_batched_request(self) -> List[Sequence]:
-        while (
-            len(self.active_requests) < self.batch_size
-            and not self.incoming_requests.empty()
-        ):
-            sequence = self.incoming_requests.get()
-            self.active_requests.append(sequence)
+    def get_sequence(self, seq_id: str) -> List[Sequence]:
+        return self.seq_map[seq_id]
+
+    def add_streaming_request(self, prompt: str, client_stream: Queue, loop):
+        """
+        Add the prompt sequence into  the request queue and to the sequence map for tracking
+        """
+        request_id = str(uuid.uuid4())
+        sequence = Sequence(request_id, prompt, client_stream, loop)
+        self.incoming_requests.put(sequence)  # Add Sequence into the request Queue
+        self.seq_map[request_id] = sequence  # Tracking the prompt here
+        return request_id
+
+    def generate_batched_request(self, is_streaming: bool) -> List[Sequence]:
+        if is_streaming:
+            pass
+        else:
+            while (
+                len(self.active_requests) < self.batch_size
+                and not self.incoming_requests.empty()
+            ):
+                sequence = self.incoming_requests.get()
+                self.active_requests.append(sequence)
 
         return self.active_requests
 
@@ -286,3 +398,12 @@ class WorkloadManager:
             sequence = self.request_map[sequence_id]
             return sequence.isFinished
         return False
+
+    def remove_finished_sequence(self, seq_id):
+        if seq_id in self.seq_map:
+            sequence = self.seq_map[seq_id]
+            if sequence in self.active_requests:
+                self.active_requests.remove(sequence)
+            if sequence in self.active_streaming_sequence:
+                self.active_streaming_sequence.remove(sequence)
+            del self.seq_map[seq_id]
