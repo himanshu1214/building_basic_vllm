@@ -1,9 +1,16 @@
-from pydantic import ConfigDict, BaseModel
-from typing import Any
-from fastapi import app
-import torch
-from typing import Dict
 import json
+from typing import Any, Dict
+
+import numpy as np
+import requests
+import torch
+import torchvision.transforms as transforms
+import tritonclient.http as httpclient
+from fastapi import app
+from PIL import Image
+from pydantic import BaseModel, ConfigDict
+from torchvision.models import MobileNet_V2_Weights, mobilenet_v2
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 class PredictionRequest(BaseModel):
@@ -51,18 +58,12 @@ class ModelManager:
         return self.model_cache[model_id]
 
 
-class Modelstore:
-    def __init__(self):
-
-        pass
-
-
 class ModelEngine:
     def create_worker(self, model_metadata: ModelMetadata) -> ModelWorker:
         if model_metadata.framework == "transformers":
             self.workers[model_metadata.id] = TransformerWorker(model_metadata)
         elif model_metadata.framerwork == "torchvision":
-            self.workers[model_metadata.id] = TorchVision(model_metadata)
+            self.workers[model_metadata.id] = TorchVisionWorker(model_metadata)
 
         return self.workers[model_metadata.id]
 
@@ -77,6 +78,10 @@ class ModelMetadata:
 
 
 class ModelStore:
+    """
+    This Store basically loads the model metadata
+    """
+
     def __init__(self, config_path: str):
         self.models: Dict[str, ModelMetadata] = {}
         self._load_config(config_path)
@@ -94,11 +99,19 @@ class ModelWorker:
 
 
 class TransformerWorker(ModelWorker):
+    """
+    This class uses the Model Worker and implements the tokenization and
+    predictions
+    """
+
     def __init__(self, model_metadata):
         self.tokenizer = None
         super().__init__(model_metadata)
 
     def load_model(self):
+        """
+        Model load and tokenizer
+        """
         if self.model is None:
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 self.model_metadata.name
@@ -106,6 +119,9 @@ class TransformerWorker(ModelWorker):
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_metadata.name)
 
     def predict(self, input_data):
+        """
+        Main method for prediction
+        """
         inputs = self.tokenizer(
             input_data, return_tensors="pt", padding=True, truncation=True
         )
@@ -114,6 +130,99 @@ class TransformerWorker(ModelWorker):
 
         predictions = torch.softmax(output.logits, dim=1)
         return {"predictions": predictions.tolist()}
+
+
+class TorchVisionWorker:
+    def __init__(self, model_metadata):
+        self.transform = None
+        super.__init__(model_metadata)
+
+    def _load_model(self):
+        """
+        Load models
+        """
+        if self.model is None:
+            self.model = mobilenet_v2(weights=MobileNet_V2_Weights.DEFAULT)
+            self.model.eval()
+            self.transform = transforms.Compose(
+                [
+                    transforms.Resize(256),
+                    transforms.CenterCrop(224),
+                    transforms.ToTensor(),
+                    transforms.Normalize(
+                        mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                    ),
+                ]
+            )
+
+    def predict(self, input_data):
+        """
+        Prediction for model using TorchVision framework
+        """
+        if self.model is None or self.transform is None:
+            raise (f"Model not loaded : {self.mode} or transform : {self.transform}")
+
+        if isinstance(input_data, str):
+            image = Image.open(input_data).convert("RGB")
+        else:
+            image = input_data
+
+        image_tnsor = self.transform(image).unsqueeze(0)
+        with torch.no_grad():
+            output = self.model(image_tnsor)
+        predictions = torch.softmax(output, dim=1)
+        return {"predictions": predictions.tolist()}
+
+
+class TritonWorker(ModelWorker):
+    def __init__(self, model_metadata):
+        self.host = "0.0.0.0:8009"
+        self.client = httpclient.InferenceServerClient(url=self.host)
+        super().__init__(model_metadata)
+
+    def _load_model(self):
+        url = f"http://{self.host}/v2/repository/models/{self.model.metadata.name}/load"
+        response = requests.post(url)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Model failed with response code: {response.status_code}"
+            )
+        if self.client.is_model_ready(self.model.metadata.name):
+            raise RuntimeError(f"Failed to load the model")
+
+    def predict(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        inputs = []
+        for name, data in input_data.items():
+            if not isinstance(data, np.ndarry):
+                try:
+                    data_shape = data["shape"]
+                    content = data["data"]
+                    array = np.array(content, dtype=np.float32).reshape(data_shape)
+                except:
+                    raise ValueError("Some issue with the data")
+            else:
+                array = data.astype(np.float32)
+
+            input_tensor = httpclient.InferInput(name, array.shape, "FP32")
+            input_tensor.set_data_from_numpy(array)
+            inputs.append(input_tensor)
+
+        output_name = "fc6_1"
+        response = self.client.infer(
+            model_name=self.model_metadata.name,
+            inputs=inputs,
+            outputs=[httpclient.InferRequestedOutput(output_name)],
+        )
+
+        predictions = {output_name: response.as_numpy(output_name).tolist()}
+        return predictions
+
+    def __del__(self):
+        try:
+            unload_url = f"http://{self.host}/v2/repository/models/{self.model_metadata.name}/unload"
+            requests.post(unload_url)
+        except:
+            pass
 
 
 model_manager = ModelManager()
