@@ -1,4 +1,6 @@
 import json
+from abc import ABC
+from collections import OrderedDict
 from typing import Any, Dict
 
 import numpy as np
@@ -33,10 +35,10 @@ class ModelManager:
     def __init__(self, model_store: ModelStore, max_models: int = 2):
         self.model_store = model_store
         self.max_models = max_models
-        self.model_cache = {}
+        self.model_cache = OrderedDict()
         self.model_engine = ModelEngine()
 
-    def get_model_manager(self, model_id):
+    def get_model_worker(self, model_id):
         # Check the cache and
         if model_id in self.model_cache:
             self.model_cache.move_to_end(model_id)
@@ -50,15 +52,28 @@ class ModelManager:
 
         # LRU on model
         if len(self.model_cache) >= self.max_models:
-            id, model_worker = self.model_cache.pop(last=False)
+            id, model_worker = self.model_cache.popitem(last=False)
             self.model_worker.delete_worker(id)
 
         # Create new model cache
         self.model_cache[model_id] = self.model_engine.create_worker(model_metadata)
         return self.model_cache[model_id]
 
+    def list_loaded_models(self):
+        return {
+            model_id: worker.model_metdata.name
+            for model_id, worker in self.model_cache.items()
+        }
+
 
 class ModelEngine:
+    """
+    This class is used to create/get/delete the model worker based on the model
+    """
+
+    def __init__(self):
+        self.workers = {}
+
     def create_worker(self, model_metadata: ModelMetadata) -> ModelWorker:
         if model_metadata.framework == "transformers":
             self.workers[model_metadata.id] = TransformerWorker(model_metadata)
@@ -66,6 +81,17 @@ class ModelEngine:
             self.workers[model_metadata.id] = TorchVisionWorker(model_metadata)
 
         return self.workers[model_metadata.id]
+
+    def get_worker(self, model_id: str) -> ModelWorker:
+        """this method is used to get the worker based on the model_id"""
+        return self.workers[model_id]
+
+    def delete_worker(self, model_id) -> ModelWorker:
+        """
+        This is used to delete worker based on model_id
+        """
+        if model_id in self.workers:
+            del self.workers[model_id]
 
 
 class ModelMetadata:
@@ -79,7 +105,7 @@ class ModelMetadata:
 
 class ModelStore:
     """
-    This Store basically loads the model metadata
+    This class store the model metadata and get the model based on Model Metadata
     """
 
     def __init__(self, config_path: str):
@@ -92,9 +118,23 @@ class ModelStore:
             for model in data["model"]:
                 self.model[model["id"]] = ModelMetadata(**model)
 
+    def get_model(self, model_id):
+        return self.model[model_id]
 
-class ModelWorker:
-    def __init__(self):
+    def list_models(self):
+        return self.models
+
+
+class ModelWorker(ABC):
+    def __init__(self, model_metadata):
+        self.model_metadata = model_metadata
+        self.mode = None
+        self._load_model()
+
+    def _load_model(self):
+        pass
+
+    def predict(self):
         pass
 
 
@@ -125,7 +165,7 @@ class TransformerWorker(ModelWorker):
         inputs = self.tokenizer(
             input_data, return_tensors="pt", padding=True, truncation=True
         )
-        with torch.no_grad:
+        with torch.no_grad():
             output = self.model(**inputs)
 
         predictions = torch.softmax(output.logits, dim=1)
@@ -133,6 +173,10 @@ class TransformerWorker(ModelWorker):
 
 
 class TorchVisionWorker:
+    """
+    Torch Vision Worker
+    """
+
     def __init__(self, model_metadata):
         self.transform = None
         super.__init__(model_metadata)
@@ -175,6 +219,10 @@ class TorchVisionWorker:
 
 
 class TritonWorker(ModelWorker):
+    """
+    Triton worker class
+    """
+
     def __init__(self, model_metadata):
         self.host = "0.0.0.0:8009"
         self.client = httpclient.InferenceServerClient(url=self.host)
@@ -193,7 +241,7 @@ class TritonWorker(ModelWorker):
     def predict(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         inputs = []
         for name, data in input_data.items():
-            if not isinstance(data, np.ndarry):
+            if not isinstance(data, np.ndarray):
                 try:
                     data_shape = data["shape"]
                     content = data["data"]

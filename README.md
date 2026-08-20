@@ -20,3 +20,14 @@ curl -N -X POST http://127.0.0.1:8000/generate_stream \
         "prompt": "Explain KV cache"
       }'
 ```
+
+# TO RUN the Multi - serving model
+
+```
+uvicorn multi_model_server:app --host 127.0.0.1 --port 8000 --reload
+```
+# To test the model output in multi -model serving
+
+```
+curl http://127.0.0.1:8000/models
+```
