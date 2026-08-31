@@ -1,0 +1,26 @@
+# Map a public model name to the base URL of its Ray Serve deployment.
+# This example points at the single-model deployment started locally with:
+#   venv3/bin/serve run enterprise_serving.single_model_hosting:app
+models:
+  qwen-small:
+    url: http://127.0.0.1:8000
+
+    # Optional: send this tenant to a dedicated deployment.
+    # tenants:
+    #   premium:
+    #     url: http://qwen-premium.internal:8000
+
+    # Optional: send a fraction of requests to a canary deployment.
+    # canary:
+    #   url: http://qwen-canary.internal:8000
+    #   weight: 0.05
+
+aliases:
+  default: qwen-small
+  Qwen/Qwen2.5-0.5B: qwen-small
+
+
+draft_endpoint:
+  qwen-small:
+    url: http://qwen-small-draft:8000
+    min_new_tokens: 1024

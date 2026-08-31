@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    # rate limit traffic to 50 request per seconds
+    nginx.ingress.kubernetes.io/limit-rps: "50"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "5"
+    nginx.ingress.kubernetes.io/proxy-body-size: "8m"
+  spec:
+    rules:
+      - host: api.example
+        http:
+          path: 
+            pathType: Prefix
+            backend: 
+              service: 
+                name: enterprise-model-api-hpa
+                port: 80
